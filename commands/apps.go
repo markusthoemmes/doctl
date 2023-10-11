@@ -29,6 +29,7 @@ import (
 	"github.com/digitalocean/doctl/do"
 	"github.com/digitalocean/doctl/internal/apps"
 	"github.com/digitalocean/godo"
+	"github.com/google/go-containerregistry/pkg/name"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"
@@ -269,6 +270,20 @@ Only basic information is included with the text output format. For complete app
 
 	cmd.AddCommand(appsSpec())
 	cmd.AddCommand(appsTier())
+
+	launch := CmdBuilder(
+		cmd,
+		RunAppLaunch,
+		"launch <image>",
+		"Launches an app from the given image",
+		"",
+		Writer,
+		displayerType(&displayers.Apps{}),
+	)
+	AddStringFlag(launch, doctl.ArgAppName, "", "", "The name of the app to create. If not provided, it will be inferred from the image.")
+	AddIntFlag(launch, doctl.ArgAppInstances, "n", 1, "The amount of instances to deploy.")
+	AddStringFlag(launch, doctl.ArgAppInstanceSize, "", "", "The instance size to use for the app.")
+	AddStringFlag(launch, doctl.ArgProjectID, "", "", "The ID of the project to assign the created app and resources to. If not provided, the default project will be used.")
 
 	return cmd
 }
@@ -1028,6 +1043,130 @@ func RunAppUpgradeBuildpack(c *CmdConfig) error {
 	}
 
 	return nil
+}
+
+// RunAppLaunch launches an app from an image.
+func RunAppLaunch(c *CmdConfig) error {
+	if len(c.Args) < 1 {
+		return doctl.NewMissingArgsErr(c.NS)
+	}
+
+	image := c.Args[0]
+	ref, err := name.ParseReference(image, name.WeakValidation)
+	if err != nil {
+		return err
+	}
+
+	var registryType godo.ImageSourceSpecRegistryType
+	switch ref.Context().RegistryStr() {
+	case do.RegistryHostname:
+		registryType = godo.ImageSourceSpecRegistryType_DOCR
+	case name.DefaultRegistry:
+		registryType = godo.ImageSourceSpecRegistryType_DockerHub
+	default:
+		registryType = godo.ImageSourceSpecRegistryType_Unspecified
+	}
+	imageSource := &godo.ImageSourceSpec{
+		RegistryType: registryType,
+		Repository:   ref.Context().RepositoryStr(),
+	}
+	switch r := ref.(type) {
+	case name.Digest:
+		imageSource.Digest = r.DigestStr()
+	case name.Tag:
+		imageSource.Tag = r.TagStr()
+	}
+
+	name, err := c.Doit.GetString(c.NS, doctl.ArgAppName)
+	if err != nil {
+		return err
+	}
+	if name == "" {
+		// If no name has been specified, we infer one from the image's repository.
+
+		// We pick the last part of the repository as that's going to be the "image name".
+		repoParts := strings.Split(imageSource.Repository, "/")
+		name = repoParts[len(repoParts)-1]
+		// Only lowercase letters are allowed.
+		name = strings.ToLower(name)
+		// Sanitize illegal characters.
+		name = strings.NewReplacer(
+			"_", "-", // Underscores are illegal.
+		).Replace(name)
+		// The name must not exceed 32 characters.
+		if len(name) > 32 {
+			name = name[:32]
+		}
+	}
+
+	instances, err := c.Doit.GetInt(c.NS, doctl.ArgAppInstances)
+	if err != nil {
+		return err
+	}
+
+	instanceSize, err := c.Doit.GetString(c.NS, doctl.ArgAppInstanceSize)
+	if err != nil {
+		return err
+	}
+
+	projectID, err := c.Doit.GetString(c.NS, doctl.ArgProjectID)
+	if err != nil {
+		return err
+	}
+
+	appSpec := &godo.AppSpec{
+		Name: name,
+		Services: []*godo.AppServiceSpec{{
+			Name:             "container",
+			InstanceSizeSlug: instanceSize,
+			Image:            imageSource,
+			InstanceCount:    int64(instances),
+		}},
+	}
+
+	app, err := c.Apps().Create(&godo.AppCreateRequest{Spec: appSpec, ProjectID: projectID})
+	if err != nil {
+		if gerr, ok := err.(*godo.ErrorResponse); ok && gerr.Response.StatusCode == 409 {
+			// TODO: Verify this is an app created with just one service and an image.
+			notice("App already exists, updating with image %s", image)
+
+			apps, err := c.Apps().List(false)
+			if err != nil {
+				return err
+			}
+
+			id, err := getIDByName(apps, appSpec.Name)
+			if err != nil {
+				return err
+			}
+
+			app, err = c.Apps().Update(id, &godo.AppUpdateRequest{Spec: appSpec})
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	apps := c.Apps()
+	notice("App creation is in progress, waiting for app to be running")
+	if err := waitForActiveDeployment(apps, app.ID, app.GetPendingDeployment().GetID()); err != nil {
+		var errs error
+		errs = multierror.Append(errs, fmt.Errorf("app deployment couldn't enter `running` state: %v", err))
+		if err := c.Display(displayers.Apps{app}); err != nil {
+			errs = multierror.Append(errs, err)
+		}
+		return errs
+	}
+	app, err = c.Apps().Get(app.ID)
+	if err != nil {
+		return err
+	}
+
+	notice("App created")
+
+	return c.Display(displayers.Apps{app})
 }
 
 func getIDByName(apps []*godo.App, name string) (string, error) {

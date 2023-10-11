@@ -46,6 +46,12 @@ const (
 	ArgAppDeployment = "deployment"
 	// ArgAppDevConfig is the path to the app dev link config.
 	ArgAppDevConfig = "dev-config"
+	// ArgAppName is the name of the app to create.
+	ArgAppName = "name"
+	// ArgAppInstanceSize is the instance size to use for the component in the app.
+	ArgAppInstanceSize = "instance-size"
+	// ArgAppInstances is the amount of instances to create in the app.
+	ArgAppInstances = "instances"
 	// ArgBuildCommand is an optional build command to set for local development.
 	ArgBuildCommand = "build-command"
 	// ArgBuildpack is a buildpack id.
